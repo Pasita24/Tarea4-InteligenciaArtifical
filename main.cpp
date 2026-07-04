@@ -5,8 +5,9 @@
  * Tarea 4 - Inteligencia Artificial para Videojuegos
  * Universidad de Talca - Ingeniería en Desarrollo de Videojuegos y RV
  *
- * Uso: ./wfc_city [ancho] [alto] [semilla] [pixeles_por_celda]
- * Ejemplo: ./wfc_city 30 30 42 20
+ * Uso: ./wfc_city [ancho] [alto] [semilla] [pixeles_por_celda] [ruleset]
+ * ruleset: 0=original, 1=parque con lago, 2=estricta
+ * Ejemplo: ./wfc_city 30 30 42 20 1
  */
 
 #include <iostream>
@@ -18,17 +19,18 @@
 #include <string>
 #include <algorithm>
 #include <ctime>
+#include <cstring>   // para memcpy
 
 // =====================================================================
 // DEFINICIÓN DE TESELAS
 // =====================================================================
 
 enum TileType {
-    WATER    = 0,  // Agua (borde de ciudad costera)
-    GROUND   = 1,  // Suelo vacío / terreno libre
-    BUILDING = 2,  // Bloque de edificio
-    ROAD     = 3,  // Calle / camino
-    PARK     = 4,  // Área verde / plaza
+    WATER    = 0,
+    GROUND   = 1,
+    BUILDING = 2,
+    ROAD     = 3,
+    PARK     = 4,
     TILE_COUNT
 };
 
@@ -37,7 +39,7 @@ const char* TILE_NAMES[TILE_COUNT] = {
 };
 
 // =====================================================================
-// COLORES PPM (R, G, B)
+// COLORES (R, G, B) - se usan igual para PPM
 // =====================================================================
 
 struct Color { unsigned char r, g, b; };
@@ -45,42 +47,39 @@ struct Color { unsigned char r, g, b; };
 const Color TILE_COLORS[TILE_COUNT] = {
     {100, 149, 237},  // WATER    — azul aciano
     {180, 200, 130},  // GROUND   — verde musgo claro
-    {210, 155,  90},  // BUILDING — beige cálido / naranja edificio
+    {210, 155,  90},  // BUILDING — beige cálido
     {150, 150, 150},  // ROAD     — gris asfalto
     { 90, 170,  90},  // PARK     — verde brillante
 };
 
 // =====================================================================
-// REGLAS DE ADYACENCIA
-// ADJACENCY[A][B] = true  =>  la tesela A puede estar junto a la tesela B
-// Las reglas son simétricas (se cumple en ambas direcciones).
-// =====================================================================
-
-const bool ADJACENCY[TILE_COUNT][TILE_COUNT] = {
-    //          WATER   GROUND  BUILDING  ROAD    PARK
-    /* WATER */  { true,  true,  false,   false,  false },
-    /* GROUND */ { true,  true,  true,    true,   true  },
-    /* BUILD  */ { false, true,  true,    true,   false },
-    /* ROAD   */ { false, true,  true,    true,   true  },
-    /* PARK   */ { false, true,  false,   true,   true  },
-};
-
-// =====================================================================
-// CLASE WFC
+// CLASE WFC (con reglas dinámicas y pesos opcionales)
 // =====================================================================
 
 class WFC {
 public:
     int width, height;
-    // grid[y][x] = conjunto de teselas posibles para esa celda
     std::vector<std::vector<std::set<int>>> grid;
     std::mt19937 rng;
     bool contradiction;
 
-    WFC(int w, int h, unsigned int seed)
+    // Matriz de adyacencia (dinámica, no global)
+    bool adjacency[TILE_COUNT][TILE_COUNT];
+
+    // Pesos para la selección ponderada (todos 1 por defecto)
+    double weights[TILE_COUNT];
+
+    // Constructor con ruleset
+    WFC(int w, int h, unsigned int seed, int ruleset = 0)
         : width(w), height(h), rng(seed), contradiction(false)
     {
-        // Inicialización: todas las celdas comienzan en superposición total
+        // Inicializar pesos por defecto (todos 1)
+        for (int i = 0; i < TILE_COUNT; i++) weights[i] = 1.0;
+
+        // Cargar las reglas según el ruleset
+        loadRules(ruleset);
+
+        // Inicializar grid con todas las teselas posibles
         grid.assign(height, std::vector<std::set<int>>(width));
         for (int y = 0; y < height; y++)
             for (int x = 0; x < width; x++)
@@ -88,8 +87,110 @@ public:
                     grid[y][x].insert(t);
     }
 
-    // Retorna la celda con menor entropía (más restringida, > 1 posibilidad).
-    // Retorna {-1,-1} si todas están colapsadas (éxito) o hay contradicción.
+    // Carga las reglas de adyacencia según el conjunto elegido
+    void loadRules(int ruleset) {
+        // Primero, poner todas las reglas a false por defecto
+        for (int i = 0; i < TILE_COUNT; i++)
+            for (int j = 0; j < TILE_COUNT; j++)
+                adjacency[i][j] = false;
+
+        // Definir los conjuntos según ruleset
+        if (ruleset == 0) {
+            // ========== ORIGINAL (ciudad costera) ==========
+            // Agua: solo con agua y suelo
+            adjacency[WATER][WATER] = true;
+            adjacency[WATER][GROUND] = true;
+            adjacency[GROUND][WATER] = true;
+            // Suelo: con todo
+            for (int t = 0; t < TILE_COUNT; t++) {
+                adjacency[GROUND][t] = true;
+                adjacency[t][GROUND] = true;
+            }
+            // Edificio: con suelo, edificio, calle
+            adjacency[BUILDING][GROUND] = true;
+            adjacency[GROUND][BUILDING] = true;
+            adjacency[BUILDING][BUILDING] = true;
+            adjacency[BUILDING][ROAD] = true;
+            adjacency[ROAD][BUILDING] = true;
+            // Calle: con suelo, edificio, calle, parque
+            adjacency[ROAD][GROUND] = true;
+            adjacency[GROUND][ROAD] = true;
+            adjacency[ROAD][ROAD] = true;
+            adjacency[ROAD][PARK] = true;
+            adjacency[PARK][ROAD] = true;
+            // Parque: con suelo, calle, parque
+            adjacency[PARK][GROUND] = true;
+            adjacency[GROUND][PARK] = true;
+            adjacency[PARK][PARK] = true;
+            // (ya se agregó ROAD-PARK arriba)
+        }
+        else if (ruleset == 1) {
+            // ========== PARQUE CON LAGO ==========
+            // Agua solo con agua y suelo (para formar lagos rodeados de pasto)
+            adjacency[WATER][WATER] = true;
+            adjacency[WATER][GROUND] = true;
+            adjacency[GROUND][WATER] = true;
+            // Suelo con todo (es el elemento principal)
+            for (int t = 0; t < TILE_COUNT; t++) {
+                adjacency[GROUND][t] = true;
+                adjacency[t][GROUND] = true;
+            }
+            // Edificio: solo con suelo y edificio (sin calles ni parques, para no aparecer)
+            adjacency[BUILDING][GROUND] = true;
+            adjacency[GROUND][BUILDING] = true;
+            adjacency[BUILDING][BUILDING] = true;
+            // Calle: solo con suelo y calle (para que aparezcan caminos)
+            adjacency[ROAD][GROUND] = true;
+            adjacency[GROUND][ROAD] = true;
+            adjacency[ROAD][ROAD] = true;
+            // Parque: solo con suelo y parque (para que crezcan zonas verdes)
+            adjacency[PARK][GROUND] = true;
+            adjacency[GROUND][PARK] = true;
+            adjacency[PARK][PARK] = true;
+            // No permitimos edificio con agua, ni calle con agua, ni parque con agua (excepto suelo)
+            // Ya está implícito porque solo WATER-GROUND y WATER-WATER son true.
+            // Para dar más protagonismo al agua y al parque, podemos ajustar pesos después.
+            // Aquí solo definimos reglas.
+        }
+        else if (ruleset == 2) {
+            // ========== ESTRICTA (urbana con manzanas) ==========
+            // Agua solo con agua y suelo
+            adjacency[WATER][WATER] = true;
+            adjacency[WATER][GROUND] = true;
+            adjacency[GROUND][WATER] = true;
+            // Suelo con todo (sigue siendo conector)
+            for (int t = 0; t < TILE_COUNT; t++) {
+                adjacency[GROUND][t] = true;
+                adjacency[t][GROUND] = true;
+            }
+            // Edificio solo con suelo y calle (no edificio-edificio, para forzar manzanas)
+            adjacency[BUILDING][GROUND] = true;
+            adjacency[GROUND][BUILDING] = true;
+            adjacency[BUILDING][ROAD] = true;
+            adjacency[ROAD][BUILDING] = true;
+            // Calle con suelo, edificio, calle, parque
+            adjacency[ROAD][GROUND] = true;
+            adjacency[GROUND][ROAD] = true;
+            adjacency[ROAD][ROAD] = true;
+            adjacency[ROAD][PARK] = true;
+            adjacency[PARK][ROAD] = true;
+            // Parque con suelo, calle, parque
+            adjacency[PARK][GROUND] = true;
+            adjacency[GROUND][PARK] = true;
+            adjacency[PARK][PARK] = true;
+        }
+        else {
+            // Por defecto, cargar el original
+            loadRules(0);
+        }
+    }
+
+    // Método para establecer pesos (se puede llamar desde main)
+    void setWeights(double w[TILE_COUNT]) {
+        for (int i = 0; i < TILE_COUNT; i++) weights[i] = w[i];
+    }
+
+    // Retorna la celda con menor entropía (>1 posibilidad)
     std::pair<int,int> getMinEntropyCell() {
         int minEntropy = TILE_COUNT + 1;
         std::pair<int,int> result = {-1, -1};
@@ -110,22 +211,27 @@ public:
         return result;
     }
 
-    // Colapsa la celda (x, y) eligiendo aleatoriamente una de sus teselas posibles.
+    // Colapso con selección ponderada
     void collapse(int x, int y) {
         auto& possible = grid[y][x];
         if (possible.empty()) { contradiction = true; return; }
 
-        int idx = std::uniform_int_distribution<int>(0, (int)possible.size() - 1)(rng);
-        auto it = possible.begin();
-        std::advance(it, idx);
-        int chosen = *it;
+        // Construir listas de tipos y pesos
+        std::vector<int> types;
+        std::vector<double> probs;
+        for (int t : possible) {
+            types.push_back(t);
+            probs.push_back(weights[t]);
+        }
+        // Muestreo ponderado
+        std::discrete_distribution<int> dist(probs.begin(), probs.end());
+        int chosen = types[dist(rng)];
 
         possible.clear();
         possible.insert(chosen);
     }
 
-    // Propagación de restricciones via BFS desde la celda colapsada.
-    // Elimina de las celdas vecinas las teselas que ya no son compatibles.
+    // Propagación BFS
     void propagate(int startX, int startY) {
         const int dx[] = {0, 0, 1, -1};
         const int dy[] = {1, -1, 0, 0};
@@ -143,20 +249,18 @@ public:
                 if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
 
                 auto& neighborSet = grid[ny][nx];
-                if (neighborSet.size() == 1) continue; // ya colapsada
+                if (neighborSet.size() == 1) continue;
 
-                // Construir conjunto de teselas vecinas aún válidas
                 std::set<int> valid;
                 for (int nt : neighborSet) {
                     for (int ct : grid[cy][cx]) {
-                        if (ADJACENCY[ct][nt]) {
+                        if (adjacency[ct][nt]) {
                             valid.insert(nt);
                             break;
                         }
                     }
                 }
 
-                // Si se redujeron las posibilidades, encolar para propagar
                 if (valid.size() < neighborSet.size()) {
                     neighborSet = valid;
                     if (neighborSet.empty()) {
@@ -169,13 +273,12 @@ public:
         }
     }
 
-    // Ejecuta el algoritmo WFC completo.
-    // Retorna true si se completó sin contradicciones.
+    // Ejecutar WFC completo
     bool run() {
         while (true) {
             auto [x, y] = getMinEntropyCell();
             if (contradiction) return false;
-            if (x == -1) return true; // todas las celdas colapsadas
+            if (x == -1) return true;
 
             collapse(x, y);
             if (contradiction) return false;
@@ -184,56 +287,74 @@ public:
         }
     }
 
-    // Obtiene la tesela final de una celda colapsada.
+    // Obtener tesela final
     int getTile(int x, int y) const {
         if (grid[y][x].empty()) return -1;
         return *grid[y][x].begin();
     }
 
-    // Exporta el mapa generado como imagen PPM binaria (P6).
-    // cellSize: cantidad de píxeles por celda (recomendado: 16-24).
-    void savePPM(const std::string& filename, int cellSize = 20) const {
+    // ================================================================
+    // EXPORTACIÓN PPM (ahora en formato ASCII P3 por compatibilidad)
+    // ================================================================
+    void savePPM(const std::string& filename, int cellSize = 20, bool binary = false) const {
         int imgW = width  * cellSize;
         int imgH = height * cellSize;
 
-        std::ofstream f(filename, std::ios::binary);
+        std::ofstream f(filename);
         if (!f.is_open()) {
-            std::cerr << "Error: no se pudo abrir el archivo " << filename << "\n";
+            std::cerr << "Error: no se pudo abrir " << filename << "\n";
             return;
         }
 
-        // Cabecera PPM
-        f << "P6\n" << imgW << " " << imgH << "\n255\n";
-
-        for (int py = 0; py < imgH; py++) {
-            for (int px = 0; px < imgW; px++) {
-                int cx = px / cellSize;
-                int cy = py / cellSize;
-                int tile = getTile(cx, cy);
-
-                Color c = (tile >= 0) ? TILE_COLORS[tile] : Color{255, 0, 255};
-
-                // Línea de grilla sutil para separar celdas visualmente
-                bool isBorder = (cellSize > 5) &&
-                                (px % cellSize == 0 || py % cellSize == 0);
-                if (isBorder) {
-                    c.r = (unsigned char)(c.r * 0.65);
-                    c.g = (unsigned char)(c.g * 0.65);
-                    c.b = (unsigned char)(c.b * 0.65);
+        if (binary) {
+            // Formato binario P6 (más compacto)
+            f << "P6\n" << imgW << " " << imgH << "\n255\n";
+            for (int py = 0; py < imgH; py++) {
+                for (int px = 0; px < imgW; px++) {
+                    int cx = px / cellSize;
+                    int cy = py / cellSize;
+                    int tile = getTile(cx, cy);
+                    Color c = (tile >= 0) ? TILE_COLORS[tile] : Color{255, 0, 255};
+                    // Línea de grilla
+                    bool isBorder = (cellSize > 5) &&
+                                    (px % cellSize == 0 || py % cellSize == 0);
+                    if (isBorder) {
+                        c.r = (unsigned char)(c.r * 0.65);
+                        c.g = (unsigned char)(c.g * 0.65);
+                        c.b = (unsigned char)(c.b * 0.65);
+                    }
+                    f.put(c.r);
+                    f.put(c.g);
+                    f.put(c.b);
                 }
-
-                f.put(c.r);
-                f.put(c.g);
-                f.put(c.b);
+            }
+        } else {
+            // Formato ASCII P3 (legible, compatible con muchos visores)
+            f << "P3\n" << imgW << " " << imgH << "\n255\n";
+            for (int py = 0; py < imgH; py++) {
+                for (int px = 0; px < imgW; px++) {
+                    int cx = px / cellSize;
+                    int cy = py / cellSize;
+                    int tile = getTile(cx, cy);
+                    Color c = (tile >= 0) ? TILE_COLORS[tile] : Color{255, 0, 255};
+                    bool isBorder = (cellSize > 5) &&
+                                    (px % cellSize == 0 || py % cellSize == 0);
+                    if (isBorder) {
+                        c.r = (unsigned char)(c.r * 0.65);
+                        c.g = (unsigned char)(c.g * 0.65);
+                        c.b = (unsigned char)(c.b * 0.65);
+                    }
+                    f << (int)c.r << " " << (int)c.g << " " << (int)c.b << " ";
+                }
+                f << "\n";
             }
         }
-
         f.close();
         std::cout << "  Imagen guardada: " << filename
                   << " (" << imgW << "x" << imgH << " px)\n";
     }
 
-    // Imprime estadísticas del mapa generado.
+    // Estadísticas
     void printStats(unsigned int seed) const {
         int counts[TILE_COUNT] = {};
         int total = width * height;
@@ -258,24 +379,34 @@ public:
 // =====================================================================
 
 int main(int argc, char* argv[]) {
-    // Parámetros configurables (pueden pasarse por línea de comandos)
+    // Parámetros
     int width    = (argc > 1) ? std::stoi(argv[1]) : 30;
     int height   = (argc > 2) ? std::stoi(argv[2]) : 30;
     unsigned int seed = (argc > 3)
                         ? (unsigned int)std::stoul(argv[3])
                         : (unsigned int)std::time(nullptr);
     int cellSize = (argc > 4) ? std::stoi(argv[4]) : 20;
+    int ruleset  = (argc > 5) ? std::stoi(argv[5]) : 0;  // nuevo parámetro
 
     const int MAX_RETRIES = 30;
 
     std::cout << "=== Wave Function Collapse - Generador de Ciudad ===\n";
     std::cout << "Parametros: " << width << "x" << height
               << " | semilla base=" << seed
-              << " | celda=" << cellSize << "px\n\n";
+              << " | celda=" << cellSize << "px"
+              << " | ruleset=" << ruleset << "\n\n";
 
     for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
         unsigned int currentSeed = seed + (unsigned int)attempt;
-        WFC wfc(width, height, currentSeed);
+        WFC wfc(width, height, currentSeed, ruleset);
+
+        // Opcional: ajustar pesos para favorecer ciertos tipos (ejemplo para ruleset=1)
+        if (ruleset == 1) {
+            // Para el parque con lago, queremos más agua y parque, menos edificios y calles
+            double w[TILE_COUNT] = {2.0, 1.0, 0.2, 0.5, 2.5}; // agua y parque con más peso
+            wfc.setWeights(w);
+        }
+
         bool success = wfc.run();
 
         if (success) {
@@ -285,11 +416,14 @@ int main(int argc, char* argv[]) {
             std::string fname = "output_" + std::to_string(width)
                               + "x" + std::to_string(height)
                               + "_seed" + std::to_string(currentSeed)
+                              + "_ruleset" + std::to_string(ruleset)
                               + ".ppm";
-            wfc.savePPM(fname, cellSize);
+            // Guardar en formato ASCII (P3) para compatibilidad con visores simples
+            wfc.savePPM(fname, cellSize, false); // false = ASCII
+
             std::cout << "\nListo. Para visualizar: abre el archivo .ppm\n";
-            std::cout << "con GIMP, IrfanView, o convierte con: convert "
-                      << fname << " output.png\n";
+            std::cout << "con GIMP, IrfanView, o conviértelo a PNG:\n";
+            std::cout << "  convert " << fname << " " << fname.substr(0, fname.size()-4) << ".png\n";
             return 0;
         } else {
             std::cout << "Contradiccion en intento " << (attempt + 1)
